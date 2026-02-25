@@ -10,29 +10,59 @@ const PROXY_SECRET = process.env.PROXY_SECRET || process.env.proxy_secret || pro
 const C6_CERTIFICATE = process.env.C6_CERTIFICATE;
 const C6_PRIVATE_KEY = process.env.C6_PRIVATE_KEY;
 
-console.log('ENV CHECK:');
-console.log('- PORT:', PORT);
-console.log('- PROXY_SECRET set:', !!PROXY_SECRET);
-console.log('- C6_CERTIFICATE set:', !!C6_CERTIFICATE, 'length:', (C6_CERTIFICATE || '').length);
-console.log('- C6_PRIVATE_KEY set:', !!C6_PRIVATE_KEY, 'length:', (C6_PRIVATE_KEY || '').length);
+console.log('=== C6 mTLS Proxy Starting ===');
+console.log('PORT:', PORT);
+console.log('PROXY_SECRET configured:', !!PROXY_SECRET);
+console.log('C6_CERTIFICATE length:', (C6_CERTIFICATE || '').length);
+console.log('C6_PRIVATE_KEY length:', (C6_PRIVATE_KEY || '').length);
 
+// Always strip and rebuild PEM to avoid invisible chars, wrong line breaks, etc.
 function formatPEM(content, type) {
   if (!content) return null;
-  if (content.includes('-----BEGIN') && content.includes('\n')) {
-    return content.trim();
-  }
-  if (content.includes('\\n')) {
-    return content.replace(/\\n/g, '\n').trim();
-  }
   var cleaned = content
-    .replace(/-----BEGIN.*?-----/g, '')
-    .replace(/-----END.*?-----/g, '')
-    .replace(/\s+/g, '');
+    .replace(/\\n/g, '\n')
+    .replace(/-----BEGIN[^-]*-----/g, '')
+    .replace(/-----END[^-]*-----/g, '')
+    .replace(/[\s\r\n]+/g, '');
+  if (cleaned.length === 0) return null;
   var lines = [];
   for (var i = 0; i < cleaned.length; i += 64) {
     lines.push(cleaned.substring(i, i + 64));
   }
   return '-----BEGIN ' + type + '-----\n' + lines.join('\n') + '\n-----END ' + type + '-----';
+}
+
+// Try both RSA PRIVATE KEY and PRIVATE KEY formats
+var formattedCert = formatPEM(C6_CERTIFICATE, 'CERTIFICATE');
+var formattedKeyRSA = formatPEM(C6_PRIVATE_KEY, 'RSA PRIVATE KEY');
+var formattedKeyPKCS8 = formatPEM(C6_PRIVATE_KEY, 'PRIVATE KEY');
+
+// Detect which key format works
+var formattedKey = null;
+var keyFormat = 'none';
+
+if (C6_PRIVATE_KEY) {
+  if (C6_PRIVATE_KEY.indexOf('RSA PRIVATE KEY') >= 0) {
+    formattedKey = formattedKeyRSA;
+    keyFormat = 'RSA';
+  } else if (C6_PRIVATE_KEY.indexOf('PRIVATE KEY') >= 0) {
+    formattedKey = formattedKeyPKCS8;
+    keyFormat = 'PKCS8';
+  } else {
+    // No header found, try RSA first (most common for C6)
+    formattedKey = formattedKeyRSA;
+    keyFormat = 'RSA (guessed)';
+  }
+}
+
+if (formattedCert && formattedKey) {
+  console.log('mTLS certificates formatted OK');
+  console.log('Key format:', keyFormat);
+  console.log('Cert base64 length:', formattedCert.replace(/-----[^-]*-----/g, '').replace(/\s/g, '').length);
+  console.log('Key base64 length:', formattedKey.replace(/-----[^-]*-----/g, '').replace(/\s/g, '').length);
+} else {
+  console.log('WARNING: mTLS certificates NOT available');
+  console.log('Cert OK:', !!formattedCert, '| Key OK:', !!formattedKey);
 }
 
 function makeHTTPSRequest(url, method, headers, body, cert, key) {
@@ -43,12 +73,12 @@ function makeHTTPSRequest(url, method, headers, body, cert, key) {
       port: parsed.port || 443,
       path: parsed.pathname + parsed.search,
       method: method,
-      headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
+      headers: Object.assign({}, headers),
       cert: cert,
       key: key,
-      rejectUnauthorized: true,
+      rejectUnauthorized: true
     };
-    console.log('[mtls] Request to:', parsed.hostname, parsed.pathname);
+    console.log('[mtls] ' + method + ' -> ' + parsed.hostname + parsed.pathname);
     var req = https.request(options, function(res) {
       var data = '';
       res.on('data', function(chunk) { data += chunk; });
@@ -61,7 +91,11 @@ function makeHTTPSRequest(url, method, headers, body, cert, key) {
       });
     });
     req.on('error', function(err) {
-      console.error('[mtls] Request error:', err.message);
+      console.error('[mtls] Error:', err.code, err.message);
+      // If RSA format fails, try PKCS8 and vice versa
+      if (err.message.indexOf('bad base64') >= 0 || err.message.indexOf('unsupported') >= 0) {
+        console.log('[mtls] Key format issue detected, trying alternate format...');
+      }
       reject(err);
     });
     if (body) {
@@ -71,15 +105,24 @@ function makeHTTPSRequest(url, method, headers, body, cert, key) {
   });
 }
 
-var formattedCert = formatPEM(C6_CERTIFICATE, 'CERTIFICATE');
-var formattedKey = formatPEM(C6_PRIVATE_KEY, 'RSA PRIVATE KEY');
-
-if (formattedCert && formattedKey) {
-  console.log('mTLS certificates formatted successfully');
-  console.log('- Cert starts with:', formattedCert.substring(0, 40));
-  console.log('- Key starts with:', formattedKey.substring(0, 40));
-} else {
-  console.log('WARNING: mTLS certificates NOT available');
+// Retry with alternate key format on failure
+function makeHTTPSRequestWithRetry(url, method, headers, body, cert) {
+  return makeHTTPSRequest(url, method, headers, body, cert, formattedKey)
+    .catch(function(err) {
+      if (err.message.indexOf('PEM') >= 0 || err.message.indexOf('base64') >= 0 || err.message.indexOf('key') >= 0) {
+        console.log('[mtls] Retrying with alternate key format...');
+        var altKey = keyFormat.indexOf('RSA') >= 0 ? formattedKeyPKCS8 : formattedKeyRSA;
+        return makeHTTPSRequest(url, method, headers, body, cert, altKey)
+          .then(function(result) {
+            // If alternate works, update for future calls
+            formattedKey = altKey;
+            keyFormat = keyFormat.indexOf('RSA') >= 0 ? 'PKCS8 (auto-detected)' : 'RSA (auto-detected)';
+            console.log('[mtls] Alternate key format worked! Using:', keyFormat);
+            return result;
+          });
+      }
+      throw err;
+    });
 }
 
 function authenticate(req, res, next) {
@@ -91,50 +134,9 @@ function authenticate(req, res, next) {
 }
 
 app.get('/health', function(req, res) {
-  var certRawPreview = (C6_CERTIFICATE || '').substring(0, 100);
-  var keyRawPreview = (C6_PRIVATE_KEY || '').substring(0, 100);
-  var certFmtPreview = (formattedCert || '').substring(0, 100);
-  var keyFmtPreview = (formattedKey || '').substring(0, 100);
   res.json({
     status: 'ok',
+    version: '3.0.0',
     mtls: !!(formattedCert && formattedKey),
-    cert_len: (C6_CERTIFICATE || '').length,
-    key_len: (C6_PRIVATE_KEY || '').length,
-    cert_formatted_len: (formattedCert || '').length,
-    key_formatted_len: (formattedKey || '').length,
-    cert_raw_preview: certRawPreview,
-    cert_fmt_preview: certFmtPreview,
-    key_raw_preview: keyRawPreview.substring(0, 40),
-    key_fmt_preview: keyFmtPreview.substring(0, 40),
-    cert_has_real_newlines: (C6_CERTIFICATE || '').includes('\n'),
-    cert_has_escaped_newlines: (C6_CERTIFICATE || '').includes('\\n'),
-    timestamp: new Date().toISOString()
-  });
-});
-
-
-app.post('/proxy', authenticate, async function(req, res) {
-  try {
-    var url = req.body.url;
-    var method = req.body.method || 'POST';
-    var headers = req.body.headers || {};
-    var body = req.body.body;
-    if (!url) {
-      return res.status(400).json({ error: 'URL is required' });
-    }
-    if (!formattedCert || !formattedKey) {
-      return res.status(500).json({ error: 'mTLS certificates not configured' });
-    }
-    console.log('[proxy] ' + method + ' ' + url);
-    var result = await makeHTTPSRequest(url, method, headers, body, formattedCert, formattedKey);
-    console.log('[proxy] Response: ' + result.status);
-    res.status(result.status).json(result);
-  } catch (error) {
-    console.error('[proxy] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.listen(PORT, function() {
-  console.log('C6 mTLS Proxy running on port ' + PORT);
-});
+    key_format: keyFormat,
+    cert_base64_len: formattedCert ? formattedCert.replace(/-----[^-]*--
