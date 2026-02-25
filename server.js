@@ -139,4 +139,42 @@ app.get('/health', function(req, res) {
     version: '3.0.0',
     mtls: !!(formattedCert && formattedKey),
     key_format: keyFormat,
-    cert_base64_len: formattedCert ? formattedCert.replace(/-----[^-]*--
+    cert_base64_len: formattedCert ? formattedCert.replace(/-----[^-]*-----/g, '').replace(/\s/g, '').length : 0,
+    key_base64_len: formattedKey ? formattedKey.replace(/-----[^-]*-----/g, '').replace(/\s/g, '').length : 0,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/proxy', authenticate, function(req, res) {
+  var url = req.body.url;
+  var method = req.body.method || 'POST';
+  var headers = req.body.headers || {};
+  var body = req.body.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  if (!formattedCert || !formattedKey) {
+    return res.status(500).json({ error: 'mTLS certificates not configured', key_format: keyFormat });
+  }
+
+  console.log('[proxy] ' + method + ' ' + url);
+
+  makeHTTPSRequestWithRetry(url, method, headers, body, formattedCert)
+    .then(function(result) {
+      console.log('[proxy] Response:', result.status);
+      res.status(result.status).json(result);
+    })
+    .catch(function(error) {
+      console.error('[proxy] Error:', error.message);
+      res.status(500).json({
+        error: error.message,
+        hint: 'Check PEM format in Railway variables. Must be valid base64 with correct headers.',
+        key_format_tried: keyFormat
+      });
+    });
+});
+
+app.listen(PORT, function() {
+  console.log('C6 mTLS Proxy v3.0.0 running on port ' + PORT);
+});
