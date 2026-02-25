@@ -1,57 +1,85 @@
 const express = require('express');
 const https = require('https');
+const { URL } = require('url');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
-const PROXY_SECRET = process.env.PROXY_SECRET || process.env.proxy_secret;
+const PROXY_SECRET = process.env.PROXY_SECRET || process.env.proxy_secret || process.env.C6_PROXY_SECRET;
 const C6_CERTIFICATE = process.env.C6_CERTIFICATE;
 const C6_PRIVATE_KEY = process.env.C6_PRIVATE_KEY;
 
+console.log('ENV CHECK:');
+console.log('- PORT:', PORT);
+console.log('- PROXY_SECRET set:', !!PROXY_SECRET);
+console.log('- C6_CERTIFICATE set:', !!C6_CERTIFICATE, 'length:', (C6_CERTIFICATE || '').length);
+console.log('- C6_PRIVATE_KEY set:', !!C6_PRIVATE_KEY, 'length:', (C6_PRIVATE_KEY || '').length);
+
 function formatPEM(content, type) {
   if (!content) return null;
-  
+  if (content.includes('-----BEGIN') && content.includes('\n')) {
+    return content.trim();
+  }
+  if (content.includes('\\n')) {
+    return content.replace(/\\n/g, '\n').trim();
+  }
   var cleaned = content
     .replace(/-----BEGIN.*?-----/g, '')
     .replace(/-----END.*?-----/g, '')
-    .replace(/\\n/g, '')
     .replace(/\s+/g, '');
-
   var lines = [];
   for (var i = 0; i < cleaned.length; i += 64) {
     lines.push(cleaned.substring(i, i + 64));
   }
-
   return '-----BEGIN ' + type + '-----\n' + lines.join('\n') + '\n-----END ' + type + '-----';
 }
 
-function createMTLSAgent() {
-  if (!C6_CERTIFICATE || !C6_PRIVATE_KEY) {
-    console.warn('C6_CERTIFICATE or C6_PRIVATE_KEY not configured - mTLS disabled');
-    return null;
-  }
-
-  try {
-    var cert = formatPEM(C6_CERTIFICATE, 'CERTIFICATE');
-    var key = formatPEM(C6_PRIVATE_KEY, 'RSA PRIVATE KEY');
-
-    return new https.Agent({
+function makeHTTPSRequest(url, method, headers, body, cert, key) {
+  return new Promise(function(resolve, reject) {
+    var parsed = new URL(url);
+    var options = {
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.pathname + parsed.search,
+      method: method,
+      headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
       cert: cert,
       key: key,
-      rejectUnauthorized: true
+      rejectUnauthorized: true,
+    };
+    console.log('[mtls] Request to:', parsed.hostname, parsed.pathname);
+    var req = https.request(options, function(res) {
+      var data = '';
+      res.on('data', function(chunk) { data += chunk; });
+      res.on('end', function() {
+        var responseHeaders = {};
+        Object.keys(res.headers).forEach(function(k) {
+          responseHeaders[k] = res.headers[k];
+        });
+        resolve({ status: res.statusCode, headers: responseHeaders, body: data });
+      });
     });
-  } catch (err) {
-    console.error('Failed to create mTLS Agent:', err.message);
-    return null;
-  }
+    req.on('error', function(err) {
+      console.error('[mtls] Request error:', err.message);
+      reject(err);
+    });
+    if (body) {
+      req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    }
+    req.end();
+  });
 }
 
-var mtlsAgent = createMTLSAgent();
-if (mtlsAgent) {
-  console.log('mTLS Agent created successfully');
+var formattedCert = formatPEM(C6_CERTIFICATE, 'CERTIFICATE');
+var formattedKey = formatPEM(C6_PRIVATE_KEY, 'RSA PRIVATE KEY');
+
+if (formattedCert && formattedKey) {
+  console.log('mTLS certificates formatted successfully');
+  console.log('- Cert starts with:', formattedCert.substring(0, 40));
+  console.log('- Key starts with:', formattedKey.substring(0, 40));
 } else {
-  console.log('mTLS Agent NOT created - check certificates');
+  console.log('WARNING: mTLS certificates NOT available');
 }
 
 function authenticate(req, res, next) {
@@ -65,57 +93,33 @@ function authenticate(req, res, next) {
 app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
-    mtls: !!mtlsAgent,
+    mtls: !!(formattedCert && formattedKey),
+    cert_len: (C6_CERTIFICATE || '').length,
+    key_len: (C6_PRIVATE_KEY || '').length,
     timestamp: new Date().toISOString()
   });
 });
 
-app.post('/proxy', authenticate, function(req, res) {
-  var url = req.body.url;
-  var method = req.body.method || 'POST';
-  var headers = req.body.headers || {};
-  var body = req.body.body;
-
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
+app.post('/proxy', authenticate, async function(req, res) {
+  try {
+    var url = req.body.url;
+    var method = req.body.method || 'POST';
+    var headers = req.body.headers || {};
+    var body = req.body.body;
+    if (!url) {
+      return res.status(400).json({ error: 'URL is required' });
+    }
+    if (!formattedCert || !formattedKey) {
+      return res.status(500).json({ error: 'mTLS certificates not configured' });
+    }
+    console.log('[proxy] ' + method + ' ' + url);
+    var result = await makeHTTPSRequest(url, method, headers, body, formattedCert, formattedKey);
+    console.log('[proxy] Response: ' + result.status);
+    res.status(result.status).json(result);
+  } catch (error) {
+    console.error('[proxy] Error:', error.message);
+    res.status(500).json({ error: error.message });
   }
-
-  if (!mtlsAgent) {
-    return res.status(500).json({ error: 'mTLS agent not configured' });
-  }
-
-  console.log('[proxy] ' + method + ' ' + url);
-
-  var fetchOptions = {
-    method: method,
-    headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
-    agent: mtlsAgent
-  };
-
-  if (body) {
-    fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body);
-  }
-
-  fetch(url, fetchOptions)
-    .then(function(response) {
-      var status = response.status;
-      var responseHeaders = {};
-      response.headers.forEach(function(value, key) {
-        responseHeaders[key] = value;
-      });
-      return response.text().then(function(responseText) {
-        console.log('[proxy] Response: ' + status);
-        res.status(status).json({
-          status: status,
-          headers: responseHeaders,
-          body: responseText
-        });
-      });
-    })
-    .catch(function(error) {
-      console.error('[proxy] Error:', error.message);
-      res.status(500).json({ error: error.message });
-    });
 });
 
 app.listen(PORT, function() {
