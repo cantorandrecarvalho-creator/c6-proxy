@@ -91,14 +91,27 @@ function authenticate(req, res, next) {
 }
 
 app.get('/health', function(req, res) {
+  var certRawPreview = (C6_CERTIFICATE || '').substring(0, 100);
+  var keyRawPreview = (C6_PRIVATE_KEY || '').substring(0, 100);
+  var certFmtPreview = (formattedCert || '').substring(0, 100);
+  var keyFmtPreview = (formattedKey || '').substring(0, 100);
   res.json({
     status: 'ok',
     mtls: !!(formattedCert && formattedKey),
     cert_len: (C6_CERTIFICATE || '').length,
     key_len: (C6_PRIVATE_KEY || '').length,
+    cert_formatted_len: (formattedCert || '').length,
+    key_formatted_len: (formattedKey || '').length,
+    cert_raw_preview: certRawPreview,
+    cert_fmt_preview: certFmtPreview,
+    key_raw_preview: keyRawPreview.substring(0, 40),
+    key_fmt_preview: keyFmtPreview.substring(0, 40),
+    cert_has_real_newlines: (C6_CERTIFICATE || '').includes('\n'),
+    cert_has_escaped_newlines: (C6_CERTIFICATE || '').includes('\\n'),
     timestamp: new Date().toISOString()
   });
 });
+
 
 app.post('/proxy', authenticate, async function(req, res) {
   try {
